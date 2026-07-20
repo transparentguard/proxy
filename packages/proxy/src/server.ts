@@ -5,10 +5,14 @@
  * Routes:
  *   GET  /health         → 200 OK (liveness probe)
  *   GET  /ready          → 200 if policy loaded, 503 if not
- *   POST /v1/chat/completions   → OpenAI handler
+ *   POST /v1/chat/completions   → OpenAI-compatible handler
  *   POST /v1/messages           → Anthropic handler
- *   POST /v1/*                  → OpenAI handler (catch-all for other v1 paths)
+ *   POST /v1/*                  → OpenAI-compatible catch-all (Groq, Mistral, etc.)
  *   *    *               → 404
+ *
+ * Auth headers:
+ *   X-TG-Key: <transparentguard-key>   — verified against Unkey (required)
+ *   Authorization: Bearer <provider-key> OR x-api-key: <provider-key> — forwarded to the AI provider as-is
  */
 
 import http from "node:http";
@@ -25,12 +29,23 @@ function makeRequestId(): string {
 }
 
 /**
- * Extract the customer's TransparentGuard API key from the request headers.
- * This is what gets verified with Unkey.
- *   1. Authorization: Bearer <key>
- *   2. x-api-key header (Anthropic convention)
+ * Extract the customer's TransparentGuard subscription key.
+ * Sent in the custom X-TG-Key header — verified against Unkey.
  */
 function extractTgApiKey(req: http.IncomingMessage): string {
+  const key = req.headers["x-tg-key"];
+  if (key) return Array.isArray(key) ? key[0] ?? "" : key;
+  return "";
+}
+
+/**
+ * Extract the AI provider key to forward upstream.
+ * Customers send their own provider key exactly as they would to the provider directly:
+ *   - OpenAI / OpenAI-compatible (Groq, Mistral, Together, etc.): Authorization: Bearer <key>
+ *   - Anthropic: x-api-key: <key>
+ * The proxy forwards this key to the upstream provider untouched.
+ */
+function extractProviderKey(req: http.IncomingMessage): string {
   const auth = req.headers["authorization"];
   if (auth && auth.toLowerCase().startsWith("bearer ")) {
     return auth.slice("bearer ".length).trim();
@@ -38,19 +53,6 @@ function extractTgApiKey(req: http.IncomingMessage): string {
   const apiKey = req.headers["x-api-key"];
   if (apiKey) return Array.isArray(apiKey) ? apiKey[0] ?? "" : apiKey;
   return "";
-}
-
-/**
- * Determine the API key to forward to the upstream (OpenAI / Anthropic).
- * Priority:
- *   1. Config override (UPSTREAM_API_KEY env var or --upstream-api-key flag)
- *   2. Customer's key from the request (BYOK fallback)
- */
-function resolveUpstreamApiKey(
-  customerKey: string,
-  configOverride: string | undefined,
-): string {
-  return configOverride ?? customerKey;
 }
 
 function isAnthropicPath(url: string): boolean {
@@ -86,16 +88,17 @@ export function startServer(config: ProxyConfig): http.Server {
 
     void (async () => {
       const tgKey = extractTgApiKey(req);
+      const providerKey = extractProviderKey(req);
 
-      // Verify the customer's TG key with Unkey (if configured)
+      // Verify the customer's TransparentGuard key with Unkey (if configured)
       const unkeyResult = await verifyUnkey(tgKey);
 
       if (unkeyResult === null) {
-        // Unkey not configured — require at least some key to be present
+        // Unkey not configured — require at least a TG key to be present
         if (!tgKey) {
           const body = JSON.stringify({
             error: {
-              message: "No API key found. Send Authorization: Bearer <key>.",
+              message: "No TransparentGuard API key found. Send X-TG-Key: <key> in your request.",
               type: "authentication_error",
               code: "no_api_key",
             },
@@ -107,7 +110,7 @@ export function startServer(config: ProxyConfig): http.Server {
       } else if (!unkeyResult.valid) {
         const body = JSON.stringify({
           error: {
-            message: "Invalid or expired API key.",
+            message: "Invalid or expired TransparentGuard API key.",
             type: "authentication_error",
             code: unkeyResult.errorCode ?? "invalid_api_key",
           },
@@ -121,7 +124,8 @@ export function startServer(config: ProxyConfig): http.Server {
         requestId: makeRequestId(),
         method,
         path: url,
-        upstreamApiKey: resolveUpstreamApiKey(tgKey, upstreamApiKey),
+        // upstreamApiKey: config override takes priority, otherwise forward customer's provider key
+        upstreamApiKey: upstreamApiKey ?? providerKey,
         startMs: Date.now(),
         tgApiKey: tgKey,
         tgKeyId: unkeyResult?.keyId ?? "",
