@@ -11,7 +11,7 @@ RUN corepack enable && corepack prepare pnpm@latest --activate
 COPY package.json pnpm-workspace.yaml ./
 COPY packages/runtime/package.json ./packages/runtime/package.json
 COPY packages/proxy/package.json   ./packages/proxy/package.json
-RUN pnpm install
+RUN pnpm install --ignore-scripts
 
 # Copy source + config
 COPY packages/runtime/src/           ./packages/runtime/src/
@@ -25,7 +25,7 @@ RUN pnpm --filter @transparentguard/proxy   run build
 
 # pnpm deploy: creates /prod with a self-contained non-symlinked node_modules
 # workspace:* links are resolved to real package contents
-RUN pnpm deploy --legacy --filter @transparentguard/proxy --prod /prod
+RUN pnpm deploy --legacy --ignore-scripts --filter @transparentguard/proxy --prod /prod
 
 # Guarantee the runtime dist is present even if pnpm deploy skips it
 # (happens when runtime package.json files field lists non-existent README/LICENSE)
