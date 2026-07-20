@@ -1,0 +1,1021 @@
+/**
+ * TransparentGuard Runtime — Policy Loader
+ * Reads a TPS YAML file, validates it against the JSON Schema,
+ * resolves `extends` inheritance chains, and verifies the Ed25519
+ * cryptographic signature if present.
+ */
+
+import fs from "fs";
+import path from "path";
+import crypto from "crypto";
+import yaml from "js-yaml";
+import Ajv from "ajv";
+import addFormats from "ajv-formats";
+import type { TPSPolicy, TPSRule, TPSSignature } from "./types.js";
+
+// ---------------------------------------------------------------------------
+// OCI Distribution Spec — policy loading from OCI registries
+// URI format: oci://registry/org/repo:tag  (e.g. oci://ghcr.io/myorg/policy:v1.2)
+// ---------------------------------------------------------------------------
+
+interface OciManifest {
+  schemaVersion: number;
+  mediaType?: string;
+  config?: { mediaType: string; digest: string; size: number };
+  layers?: Array<{ mediaType: string; digest: string; size: number; annotations?: Record<string, string> }>;
+  manifests?: Array<{ mediaType: string; digest: string; size: number; platform?: unknown }>;
+}
+
+interface OciCacheEntry {
+  policy: TPSPolicy;
+  digest: string;
+}
+
+const ociCache = new Map<string, OciCacheEntry>();
+
+const OCI_POLICY_MEDIA_TYPES = new Set([
+  "application/vnd.transparentguard.policy+yaml",
+  "application/vnd.transparentguard.policy.v1+yaml",
+  "application/octet-stream",
+  "text/plain",
+  "text/yaml",
+]);
+
+function parseOciRef(ociRef: string): { registry: string; repo: string; tag: string } {
+  // Strip oci:// prefix
+  const raw = ociRef.slice("oci://".length);
+  // First segment before / is the registry host
+  const firstSlash = raw.indexOf("/");
+  if (firstSlash === -1) {
+    throw new PolicyLoadError(`Invalid OCI reference "${ociRef}": missing repository path.`);
+  }
+  const registry = raw.slice(0, firstSlash);
+  const repoAndRef = raw.slice(firstSlash + 1);
+
+  // Split tag at last colon (avoids collisions with digest sha256:...)
+  const lastColon = repoAndRef.lastIndexOf(":");
+  const atSign = repoAndRef.indexOf("@");
+
+  let repo: string;
+  let tag: string;
+
+  if (atSign !== -1) {
+    // digest reference: repo@sha256:...
+    repo = repoAndRef.slice(0, atSign);
+    tag = repoAndRef.slice(atSign + 1); // sha256:...
+  } else if (lastColon !== -1) {
+    repo = repoAndRef.slice(0, lastColon);
+    tag = repoAndRef.slice(lastColon + 1);
+  } else {
+    repo = repoAndRef;
+    tag = "latest";
+  }
+
+  return { registry, repo, tag };
+}
+
+/** Attempt anonymous pull; if 401, obtain a Bearer token and retry. */
+async function ociGet(
+  url: string,
+  accept: string,
+  token?: string,
+): Promise<{ body: string; digest: string; token?: string }> {
+  const headers: Record<string, string> = { Accept: accept };
+  if (token) headers["Authorization"] = `Bearer ${token}`;
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 15_000);
+
+  let response: Response;
+  try {
+    response = await fetch(url, { headers, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+
+  if (response.status === 401 && !token) {
+    // Parse WWW-Authenticate to get token endpoint
+    const wwwAuth = response.headers.get("www-authenticate") ?? "";
+    const fetchedToken = await fetchOciToken(wwwAuth);
+    if (fetchedToken) {
+      return ociGet(url, accept, fetchedToken);
+    }
+  }
+
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new PolicyLoadError(
+      `OCI registry request failed: GET ${url} → HTTP ${response.status}: ${text.slice(0, 256)}`,
+    );
+  }
+
+  const body = await response.text();
+  const digest = response.headers.get("docker-content-digest") ?? sha256Hex(body);
+  return { body, digest, token };
+}
+
+async function fetchOciToken(wwwAuthenticate: string): Promise<string | null> {
+  // Parse: Bearer realm="https://...",service="...",scope="..."
+  const realmMatch = wwwAuthenticate.match(/realm="([^"]+)"/);
+  const serviceMatch = wwwAuthenticate.match(/service="([^"]+)"/);
+  const scopeMatch = wwwAuthenticate.match(/scope="([^"]+)"/);
+
+  if (!realmMatch) return null;
+
+  const tokenUrl = new URL(realmMatch[1] ?? "");
+  if (serviceMatch?.[1]) tokenUrl.searchParams.set("service", serviceMatch[1]);
+  if (scopeMatch?.[1])   tokenUrl.searchParams.set("scope",   scopeMatch[1]);
+
+  // Support basic auth credentials from env vars for private registries
+  const headers: Record<string, string> = {};
+  const username = process.env["OCI_REGISTRY_USERNAME"];
+  const password = process.env["OCI_REGISTRY_PASSWORD"];
+  if (username && password) {
+    headers["Authorization"] = `Basic ${Buffer.from(`${username}:${password}`).toString("base64")}`;
+  }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 10_000);
+  try {
+    const resp = await fetch(tokenUrl.toString(), { headers, signal: controller.signal });
+    if (!resp.ok) return null;
+    const data = await resp.json() as { token?: string; access_token?: string };
+    return data.token ?? data.access_token ?? null;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function sha256Hex(text: string): string {
+  return "sha256:" + crypto.createHash("sha256").update(text, "utf8").digest("hex");
+}
+
+async function pullOciManifest(
+  registry: string,
+  repo: string,
+  ref: string,
+): Promise<{ manifest: OciManifest; digest: string; token?: string }> {
+  const url = `https://${registry}/v2/${repo}/manifests/${ref}`;
+  const accept = [
+    "application/vnd.oci.image.manifest.v1+json",
+    "application/vnd.docker.distribution.manifest.v2+json",
+    "application/vnd.oci.image.index.v1+json",
+    "application/json",
+  ].join(", ");
+
+  const { body, digest, token } = await ociGet(url, accept);
+  let manifest: OciManifest;
+  try {
+    manifest = JSON.parse(body) as OciManifest;
+  } catch {
+    throw new PolicyLoadError(`OCI registry returned invalid manifest JSON for ${registry}/${repo}:${ref}`);
+  }
+
+  // If this is an OCI image index (multi-arch), pick the first entry
+  if (manifest.manifests?.length) {
+    const firstChild = manifest.manifests[0];
+    if (!firstChild) {
+      throw new PolicyLoadError(`OCI image index has no entries: ${registry}/${repo}:${ref}`);
+    }
+    return pullOciManifest(registry, repo, firstChild.digest);
+  }
+
+  return { manifest, digest, token };
+}
+
+async function pullOciBlob(
+  registry: string,
+  repo: string,
+  blobDigest: string,
+  token?: string,
+): Promise<string> {
+  const url = `https://${registry}/v2/${repo}/blobs/${blobDigest}`;
+  const { body } = await ociGet(url, "application/octet-stream", token);
+  return body;
+}
+
+/**
+ * Verify a Cosign signature for an OCI manifest digest.
+ *
+ * Looks for a signature image at the Cosign tag convention:
+ *   {repo}:{sha256-<hex>}.sig
+ *
+ * Verification uses the ECDSA-P256 public key at TG_COSIGN_PUBLIC_KEY_PATH.
+ * Keyless (Rekor) verification is planned for a future version.
+ */
+async function verifyCosignSignature(
+  registry: string,
+  repo: string,
+  manifestDigest: string,
+  token?: string,
+): Promise<void> {
+  const required = process.env["TG_COSIGN_VERIFY"] === "true";
+  const publicKeyPath = process.env["TG_COSIGN_PUBLIC_KEY_PATH"];
+
+  if (!required) return;
+
+  if (!publicKeyPath) {
+    throw new PolicySignatureError(
+      "TG_COSIGN_VERIFY=true but TG_COSIGN_PUBLIC_KEY_PATH is not set. " +
+      "Set it to the path of a PEM-encoded ECDSA-P256 public key.",
+    );
+  }
+
+  let publicKeyPem: string;
+  try {
+    publicKeyPem = fs.readFileSync(publicKeyPath, "utf8");
+  } catch (err) {
+    throw new PolicySignatureError(
+      `Cannot read Cosign public key at ${publicKeyPath}: ${String(err)}`,
+    );
+  }
+
+  // Cosign tag convention: sha256:<hex> → sha256-<hex>.sig
+  const sigTag = manifestDigest.replace(":", "-") + ".sig";
+
+  let sigManifest: OciManifest;
+  try {
+    const result = await pullOciManifest(registry, repo, sigTag);
+    sigManifest = result.manifest;
+  } catch (err) {
+    throw new PolicySignatureError(
+      `No Cosign signature found for ${registry}/${repo}@${manifestDigest}. ` +
+      `Sign the policy with: cosign sign ${registry}/${repo}@${manifestDigest}\n` +
+      `Original error: ${String(err)}`,
+    );
+  }
+
+  // Extract signature from the first layer's annotation
+  const sigLayer = sigManifest.layers?.[0];
+  if (!sigLayer) {
+    throw new PolicySignatureError(`Cosign signature manifest has no layers for ${registry}/${repo}.`);
+  }
+
+  const sigB64 = sigLayer.annotations?.["dev.cosignproject.cosign/signature"];
+  if (!sigB64) {
+    throw new PolicySignatureError(
+      `Cosign signature layer missing "dev.cosignproject.cosign/signature" annotation.`,
+    );
+  }
+
+  // Pull the simple signing payload from the signature blob
+  let sigPayload: string;
+  try {
+    sigPayload = await pullOciBlob(registry, repo, sigLayer.digest, token);
+  } catch (err) {
+    throw new PolicySignatureError(`Failed to fetch Cosign signature payload: ${String(err)}`);
+  }
+
+  // Verify: ECDSA-P256 signature over SHA256(payload)
+  let publicKey: crypto.KeyObject;
+  try {
+    publicKey = crypto.createPublicKey({ key: publicKeyPem, format: "pem" });
+  } catch (err) {
+    throw new PolicySignatureError(`Invalid Cosign public key PEM: ${String(err)}`);
+  }
+
+  const signatureBytes = Buffer.from(sigB64, "base64");
+  const payloadBytes = Buffer.from(sigPayload, "utf8");
+
+  const valid = crypto.verify("sha256", payloadBytes, publicKey, signatureBytes);
+
+  if (!valid) {
+    throw new PolicySignatureError(
+      `Cosign signature verification failed for ${registry}/${repo}@${manifestDigest}. ` +
+      "The policy artifact may have been tampered with.",
+    );
+  }
+}
+
+/**
+ * Load a TPS policy from an OCI artifact reference.
+ * Pulls the manifest, finds the policy YAML layer, and optionally verifies the Cosign signature.
+ * Results are cached by OCI ref + manifest digest.
+ */
+async function loadOciPolicy(ociRef: string): Promise<TPSPolicy> {
+  const { registry, repo, tag } = parseOciRef(ociRef);
+
+  const { manifest, digest, token } = await pullOciManifest(registry, repo, tag);
+
+  // Cache hit — same digest means same content
+  const cached = ociCache.get(ociRef);
+  if (cached && cached.digest === digest) {
+    return cached.policy;
+  }
+
+  // Find the policy layer
+  const layer = manifest.layers?.find(
+    (l) => OCI_POLICY_MEDIA_TYPES.has(l.mediaType),
+  ) ?? manifest.layers?.[0];
+
+  if (!layer) {
+    throw new PolicyLoadError(
+      `OCI artifact ${ociRef} has no layers. ` +
+      "Publish your policy with: oras push ${registry}/${repo}:${tag} policy.yaml:application/vnd.transparentguard.policy+yaml",
+    );
+  }
+
+  // Cosign verification (before loading content — fail fast)
+  await verifyCosignSignature(registry, repo, digest, token);
+
+  // Pull the policy YAML content
+  const rawYaml = await pullOciBlob(registry, repo, layer.digest, token);
+
+  // Parse and validate
+  const policy = parseAndValidate(rawYaml, ociRef, true);
+
+  // Resolve extends chain (supports oci:// and https:// base URIs)
+  const resolvedPolicy = await resolveExtends(policy, "", 0);
+
+  ociCache.set(ociRef, { policy: resolvedPolicy, digest });
+  return resolvedPolicy;
+}
+
+// ---------------------------------------------------------------------------
+// JSON Schema — validates required top-level structure
+// ---------------------------------------------------------------------------
+
+const TPS_SCHEMA = {
+  $schema: "https://json-schema.org/draft/2020-12/schema",
+  $id: "https://transparentguard.dev/schema/tps-v1.json",
+  title: "TransparentGuard Policy Spec v1.0",
+  type: "object",
+  required: ["tps_version", "name", "rules", "audit"],
+  additionalProperties: true,
+  properties: {
+    tps_version: { type: "string", enum: ["1.0"] },
+    name: { type: "string", minLength: 1, maxLength: 128 },
+    description: { type: "string", maxLength: 512 },
+    extends: { type: "string", minLength: 1 },
+    default_action: { type: "string", enum: ["allow", "deny"] },
+    rules: { type: "array", minItems: 0 },
+    audit: {
+      type: "object",
+      required: ["enabled"],
+      properties: {
+        enabled: { type: "boolean" },
+        destination: { type: "string" },
+        format: { type: "string", enum: ["ndjson", "json", "ocsf"] },
+        retention_days: { type: "integer", minimum: 1 },
+      },
+    },
+  },
+};
+
+const ajv = new Ajv({ allErrors: true, strict: false });
+addFormats(ajv as Parameters<typeof addFormats>[0]);
+const validateSchema = ajv.compile(TPS_SCHEMA);
+
+// ---------------------------------------------------------------------------
+// Errors
+// ---------------------------------------------------------------------------
+
+export class PolicyLoadError extends Error {
+  constructor(
+    message: string,
+    public override readonly cause?: unknown,
+  ) {
+    super(message);
+    this.name = "PolicyLoadError";
+  }
+}
+
+export class PolicySignatureError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "PolicySignatureError";
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Signature verification (Ed25519)
+// ---------------------------------------------------------------------------
+
+function verifyEd25519Signature(
+  rawYaml: string,
+  sig: TPSSignature,
+): void {
+  // Reconstruct the canonical signed payload:
+  // Parse → strip signature field → re-serialize to stable JSON.
+  let doc: Record<string, unknown>;
+  try {
+    doc = yaml.load(rawYaml) as Record<string, unknown>;
+  } catch (err) {
+    throw new PolicySignatureError(`Cannot parse policy for signature verification: ${String(err)}`);
+  }
+
+  const { signature: _sig, ...docWithoutSig } = doc;
+  void _sig;
+
+  // Canonical form: sorted-key JSON, no trailing whitespace
+  const canonical = JSON.stringify(sortObjectKeys(docWithoutSig));
+
+  // Resolve public key — either inline (public_key) or via keyring (key_id)
+  const publicKeyB64 = sig.public_key;
+  if (!publicKeyB64) {
+    if (sig.key_id) {
+      // Keyring lookup not yet implemented — warn and skip verification
+      console.warn(
+        `[TransparentGuard] Policy signature uses key_id "${sig.key_id}" but no keyring is configured. ` +
+        `Set TG_KEYRING_PATH to enable keyring-based signature verification. Skipping verification.`,
+      );
+      return;
+    }
+    throw new PolicySignatureError(
+      "Policy signature block is present but neither public_key nor key_id is set.",
+    );
+  }
+
+  let publicKeyDer: Buffer;
+  try {
+    const rawKey = Buffer.from(publicKeyB64, "base64");
+    if (rawKey.length !== 32) {
+      throw new PolicySignatureError(
+        `Invalid Ed25519 public key length: expected 32 bytes, got ${rawKey.length}.`,
+      );
+    }
+    // Node crypto expects DER-encoded SubjectPublicKeyInfo for Ed25519
+    const derPrefix = Buffer.from("302a300506032b6570032100", "hex");
+    publicKeyDer = Buffer.concat([derPrefix, rawKey]);
+  } catch (err) {
+    if (err instanceof PolicySignatureError) throw err;
+    throw new PolicySignatureError(`Invalid public key encoding: ${String(err)}`);
+  }
+
+  let signatureBytes: Buffer;
+  try {
+    signatureBytes = Buffer.from(sig.value, "base64");
+    if (signatureBytes.length !== 64) {
+      throw new PolicySignatureError(
+        `Invalid Ed25519 signature length: expected 64 bytes, got ${signatureBytes.length}.`,
+      );
+    }
+  } catch (err) {
+    if (err instanceof PolicySignatureError) throw err;
+    throw new PolicySignatureError(`Invalid signature encoding: ${String(err)}`);
+  }
+
+  const publicKey = crypto.createPublicKey({
+    key: publicKeyDer,
+    format: "der",
+    type: "spki",
+  });
+
+  const valid = crypto.verify(
+    null, // Ed25519 does not use a hash algorithm parameter
+    Buffer.from(canonical, "utf8"),
+    publicKey,
+    signatureBytes,
+  );
+
+  if (!valid) {
+    throw new PolicySignatureError(
+      "Policy signature verification failed. The policy file may have been tampered with. " +
+      "Evaluation refused. Contact your compliance officer to re-sign the policy.",
+    );
+  }
+}
+
+function verifySignature(rawYaml: string, sig: TPSSignature): void {
+  switch (sig.algorithm) {
+    case "ed25519":
+      return verifyEd25519Signature(rawYaml, sig);
+    case "rsa-pss-sha256":
+    case "ecdsa-p256-sha256":
+      // These algorithms require DER-encoded keys from a keyring.
+      // If public_key is set (ed25519-style), warn. Otherwise keyring lookup.
+      if (sig.required) {
+        throw new PolicySignatureError(
+          `Algorithm "${sig.algorithm}" requires keyring-based key lookup, which is not yet ` +
+          `configured. Set TG_KEYRING_PATH or use algorithm "ed25519" with an inline public_key.`,
+        );
+      }
+      console.warn(
+        `[TransparentGuard] Algorithm "${sig.algorithm}" is not yet supported inline. Skipping signature verification.`,
+      );
+      return;
+    default:
+      throw new PolicySignatureError(
+        `Unsupported signature algorithm: ${String(sig.algorithm)}. ` +
+        `Supported: ed25519, rsa-pss-sha256, ecdsa-p256-sha256.`,
+      );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Canonical key sorting (RFC 8785 compatible)
+// ---------------------------------------------------------------------------
+
+function sortObjectKeys(obj: unknown): unknown {
+  if (obj === null || typeof obj !== "object") return obj;
+  if (Array.isArray(obj)) return obj.map(sortObjectKeys);
+  const sorted: Record<string, unknown> = {};
+  for (const key of Object.keys(obj as object).sort()) {
+    sorted[key] = sortObjectKeys((obj as Record<string, unknown>)[key]);
+  }
+  return sorted;
+}
+
+// ---------------------------------------------------------------------------
+// Policy merge helper — shared by local/https and OCI extends resolution
+// ---------------------------------------------------------------------------
+
+/**
+ * Merge a resolved base policy with a child policy per TPS spec Section 21.2.
+ *
+ * Rules:      base rules first, overridden by child rules with the same id
+ * Frameworks: union of base and child
+ * Audit:      child completely replaces base
+ * Other:      child overrides base for every other field
+ */
+function mergeBaseWithChild(basePolicy: TPSPolicy, childPolicy: TPSPolicy): TPSPolicy {
+  const overrideRuleIds = new Set(childPolicy.rules.map((r) => r.id));
+
+  const mergedRules: TPSRule[] = [
+    ...basePolicy.rules.filter((r) => !overrideRuleIds.has(r.id)),
+    ...childPolicy.rules,
+  ];
+
+  const mergedFrameworks = Array.from(
+    new Set([
+      ...(basePolicy.compliance_frameworks ?? []),
+      ...(childPolicy.compliance_frameworks ?? []),
+    ]),
+  );
+
+  return {
+    ...basePolicy,
+    ...childPolicy,
+    rules: mergedRules,
+    compliance_frameworks: mergedFrameworks.length > 0 ? mergedFrameworks : undefined,
+    environments:    childPolicy.environments   ?? basePolicy.environments,
+    audit:           childPolicy.audit          ?? basePolicy.audit,
+    default_action:  childPolicy.default_action ?? basePolicy.default_action,
+    provider:        childPolicy.provider       ?? basePolicy.provider,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Policy `extends` resolution
+// ---------------------------------------------------------------------------
+
+const MAX_EXTENDS_DEPTH = 5;
+
+/**
+ * Resolves the `extends` field by loading the base policy and merging fields.
+ * Supports relative/absolute local file paths and https:// URIs.
+ * tps:// registry URIs are noted but not yet implemented.
+ */
+async function resolveExtends(
+  policy: TPSPolicy,
+  sourceDir: string,
+  depth: number,
+): Promise<TPSPolicy> {
+  if (!policy.extends) return policy;
+  if (depth > MAX_EXTENDS_DEPTH) {
+    throw new PolicyLoadError(
+      `Policy "${policy.name}": extends chain exceeds maximum depth of ${MAX_EXTENDS_DEPTH}. ` +
+      `Check for accidental deep chains or circular references.`,
+    );
+  }
+
+  const extendsUri = policy.extends;
+
+  let basePolicyRaw: string;
+
+  if (extendsUri.startsWith("oci://")) {
+    // OCI artifact base policy
+    try {
+      const basePolicy = await loadOciPolicy(extendsUri);
+      const resolvedBase = await resolveExtends(basePolicy, "", depth + 1);
+      return mergeBaseWithChild(resolvedBase, policy);
+    } catch (err) {
+      throw new PolicyLoadError(
+        `Policy "${policy.name}": failed to load OCI extends "${extendsUri}": ${String(err)}`,
+      );
+    }
+  } else if (extendsUri.startsWith("tps://")) {
+    // TPS policy registry — not yet implemented locally
+    // Will be implemented in a future version with the hosted registry client
+    console.warn(
+      `[TransparentGuard] tps:// registry URIs are not yet supported in this version. ` +
+      `Skipping extends: ${extendsUri}`,
+    );
+    return policy;
+  } else if (extendsUri.startsWith("https://")) {
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 10_000);
+      const response = await fetch(extendsUri, {
+        headers: { Accept: "application/vnd.transparentguard.policy+yaml, text/plain" },
+        signal: controller.signal,
+      });
+      clearTimeout(timeout);
+      if (!response.ok) {
+        throw new PolicyLoadError(
+          `Policy "${policy.name}": failed to fetch extends URI "${extendsUri}": HTTP ${response.status}`,
+        );
+      }
+      basePolicyRaw = await response.text();
+    } catch (err) {
+      if (err instanceof PolicyLoadError) throw err;
+      throw new PolicyLoadError(
+        `Policy "${policy.name}": cannot fetch extends URI "${extendsUri}": ${String(err)}`,
+      );
+    }
+  } else if (extendsUri.startsWith("http://")) {
+    throw new PolicyLoadError(
+      `Policy "${policy.name}": http:// is not permitted for extends URIs. Use https://.`,
+    );
+  } else {
+    // Local file path — relative to the directory of the current policy file
+    const resolved = path.resolve(sourceDir, extendsUri);
+    try {
+      basePolicyRaw = fs.readFileSync(resolved, "utf8");
+    } catch (err) {
+      throw new PolicyLoadError(
+        `Policy "${policy.name}": cannot read extends file "${resolved}": ${String(err)}`,
+      );
+    }
+  }
+
+  let basePolicy: TPSPolicy;
+  try {
+    basePolicy = parseAndValidate(basePolicyRaw, extendsUri, false);
+  } catch (err) {
+    throw new PolicyLoadError(
+      `Policy "${policy.name}": invalid base policy at "${extendsUri}": ${String(err)}`,
+    );
+  }
+
+  // Resolve base policy's own extends chain first
+  basePolicy = await resolveExtends(basePolicy, sourceDir, depth + 1);
+
+  return mergeBaseWithChild(basePolicy, policy);
+}
+
+// ---------------------------------------------------------------------------
+// Policy cache — avoids re-reading and re-validating on every evaluate() call
+// ---------------------------------------------------------------------------
+
+interface CacheEntry {
+  policy: TPSPolicy;
+  mtime: number;
+}
+
+const policyCache = new Map<string, CacheEntry>();
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+/**
+ * Loads a TPS policy from a YAML file path.
+ * Validates structure, resolves `extends`, and verifies signatures.
+ * Results are cached by file path and invalidated when the file changes.
+ */
+export async function loadPolicy(policyRef: string): Promise<TPSPolicy> {
+  // OCI artifact reference — pull from registry
+  if (policyRef.startsWith("oci://")) {
+    return loadOciPolicy(policyRef);
+  }
+
+  const resolved = path.resolve(policyRef);
+
+  let stat: fs.Stats;
+  try {
+    stat = fs.statSync(resolved);
+  } catch (err) {
+    throw new PolicyLoadError(`Policy file not found: ${resolved}`, err);
+  }
+
+  const cached = policyCache.get(resolved);
+  if (cached && cached.mtime === stat.mtimeMs) {
+    return cached.policy;
+  }
+
+  let rawYaml: string;
+  try {
+    rawYaml = fs.readFileSync(resolved, "utf8");
+  } catch (err) {
+    throw new PolicyLoadError(`Cannot read policy file: ${resolved}`, err);
+  }
+
+  let policy = parseAndValidate(rawYaml, resolved, true);
+
+  // Resolve extends chain
+  const sourceDir = path.dirname(resolved);
+  policy = await resolveExtends(policy, sourceDir, 0);
+
+  // Verify signature on the original file (pre-merge), not the merged policy
+  if (policy.signature) {
+    try {
+      verifySignature(rawYaml, policy.signature);
+    } catch (err) {
+      if (err instanceof PolicySignatureError && policy.signature.required) {
+        throw err; // required: true — re-throw
+      }
+      if (err instanceof PolicySignatureError) {
+        console.warn(`[TransparentGuard] Signature warning: ${err.message}`);
+      }
+    }
+  }
+
+  policyCache.set(resolved, { policy, mtime: stat.mtimeMs });
+  return policy;
+}
+
+/**
+ * Parses and validates a TPS policy from a raw YAML string.
+ * Use when you have the policy content in memory (e.g., from a database or API).
+ * Does not resolve `extends` chains or write to cache.
+ */
+export function parsePolicy(rawYaml: string, sourceName = "<inline>"): TPSPolicy {
+  return parseAndValidate(rawYaml, sourceName, true);
+}
+
+// ---------------------------------------------------------------------------
+// Internal
+// ---------------------------------------------------------------------------
+
+function parseAndValidate(rawYaml: string, sourceName: string, verifySignatureIfPresent: boolean): TPSPolicy {
+  let doc: unknown;
+  try {
+    doc = yaml.load(rawYaml);
+  } catch (err) {
+    throw new PolicyLoadError(`YAML parse error in ${sourceName}: ${String(err)}`, err);
+  }
+
+  if (!doc || typeof doc !== "object") {
+    throw new PolicyLoadError(`Policy file ${sourceName} is empty or not a YAML object.`);
+  }
+
+  const valid = validateSchema(doc);
+  if (!valid) {
+    const messages = (validateSchema.errors ?? [])
+      .map((e) => `  • ${e.instancePath || "/"}: ${e.message}`)
+      .join("\n");
+    throw new PolicyLoadError(
+      `Policy validation failed in ${sourceName}:\n${messages}`,
+    );
+  }
+
+  const policy = doc as TPSPolicy;
+
+  // Audit destination required when enabled
+  if (policy.audit.enabled && !policy.audit.destination) {
+    throw new PolicyLoadError(
+      `Policy ${policy.name}: audit.destination is required when audit.enabled is true.`,
+    );
+  }
+
+  // Validate rule IDs are unique and rules are well-formed
+  const ids = new Set<string>();
+  for (const rule of policy.rules) {
+    if (ids.has(rule.id)) {
+      throw new PolicyLoadError(
+        `Policy ${policy.name}: duplicate rule id "${rule.id}". Rule IDs must be unique.`,
+      );
+    }
+    ids.add(rule.id);
+    validateRule(rule, policy.name);
+  }
+
+  // Validate threshold IDs are unique
+  const thresholdIds = new Set<string>();
+  for (const threshold of policy.thresholds ?? []) {
+    if (!threshold.id) {
+      throw new PolicyLoadError(`Policy ${policy.name}: every threshold must have an "id" field.`);
+    }
+    if (thresholdIds.has(threshold.id)) {
+      throw new PolicyLoadError(
+        `Policy ${policy.name}: duplicate threshold id "${threshold.id}". Threshold IDs must be unique.`,
+      );
+    }
+    thresholdIds.add(threshold.id);
+    validateThreshold(threshold, policy.name, ids);
+  }
+
+  // Validate test IDs are unique
+  const testIds = new Set<string>();
+  for (const test of policy.tests ?? []) {
+    if (testIds.has(test.id)) {
+      throw new PolicyLoadError(
+        `Policy ${policy.name}: duplicate test id "${test.id}". Test IDs must be unique.`,
+      );
+    }
+    testIds.add(test.id);
+  }
+
+  // Warn on deny-by-default with no rules (not an error but worth noting)
+  if (policy.default_action === "deny" && policy.rules.length === 0) {
+    console.warn(
+      `[TransparentGuard] Policy "${policy.name}" has default_action: deny but no rules. ` +
+      `All calls will be blocked.`,
+    );
+  }
+
+  // Signature verification (only for file loads, not base-policy parsing)
+  if (verifySignatureIfPresent && policy.signature) {
+    try {
+      verifySignature(rawYaml, policy.signature);
+    } catch (err) {
+      if (err instanceof PolicySignatureError && policy.signature.required) {
+        throw err;
+      }
+      if (err instanceof PolicySignatureError) {
+        console.warn(`[TransparentGuard] Signature warning in ${sourceName}: ${err.message}`);
+      }
+    }
+  }
+
+  return policy;
+}
+
+function validateRule(rule: TPSRule, policyName: string): void {
+  const loc = `Policy ${policyName}, rule "${rule.id}"`;
+
+  if (rule.id.startsWith("tg_framework_")) {
+    throw new PolicyLoadError(
+      `${loc}: rule IDs beginning with "tg_framework_" are reserved for compliance framework rules.`,
+    );
+  }
+
+  const validStages = ["pre-request", "post-response", "both", "tool-call"];
+  if (!validStages.includes(rule.stage)) {
+    throw new PolicyLoadError(
+      `${loc}: invalid stage "${rule.stage}". Valid values: ${validStages.join(", ")}.`,
+    );
+  }
+
+  const validActions = ["redact", "classify", "enforce", "tag", "block", "log"];
+  if (!validActions.includes(rule.action)) {
+    throw new PolicyLoadError(
+      `${loc}: invalid action "${rule.action}". Valid values: ${validActions.join(", ")}.`,
+    );
+  }
+
+  // tool-call stage restrictions per spec Section 16 rule 35
+  if (rule.stage === "tool-call" && !["enforce", "tag", "log", "block"].includes(rule.action)) {
+    throw new PolicyLoadError(
+      `${loc}: stage "tool-call" only supports enforce, tag, log, and block actions.`,
+    );
+  }
+
+  if (["redact", "classify"].includes(rule.action) && !rule.targets?.length) {
+    throw new PolicyLoadError(`${loc}: action "${rule.action}" requires at least one target.`);
+  }
+
+  if (rule.action === "classify") {
+    if (!rule.classifier) {
+      throw new PolicyLoadError(`${loc}: action "classify" requires a classifier.`);
+    }
+    if (rule.threshold === undefined) {
+      throw new PolicyLoadError(`${loc}: action "classify" requires a threshold.`);
+    }
+    if (rule.threshold < 0 || rule.threshold > 1) {
+      throw new PolicyLoadError(`${loc}: threshold must be between 0.0 and 1.0.`);
+    }
+  }
+
+  if (rule.action === "enforce" && !rule.enforce_type) {
+    throw new PolicyLoadError(`${loc}: action "enforce" requires enforce_type.`);
+  }
+
+  if (rule.enforce_type === "provider_allowlist" && !rule.allowed_providers?.length) {
+    throw new PolicyLoadError(`${loc}: enforce_type "provider_allowlist" requires allowed_providers.`);
+  }
+
+  if (rule.enforce_type === "data_residency" && !rule.allowed_regions?.length) {
+    throw new PolicyLoadError(`${loc}: enforce_type "data_residency" requires allowed_regions.`);
+  }
+
+  if (rule.enforce_type === "schema_validation" && !rule.expected_schema) {
+    throw new PolicyLoadError(`${loc}: enforce_type "schema_validation" requires expected_schema.`);
+  }
+
+  if (rule.enforce_type === "tool_allowlist") {
+    if (!rule.allowed_tools?.length && !rule.blocked_tools?.length) {
+      throw new PolicyLoadError(
+        `${loc}: enforce_type "tool_allowlist" requires allowed_tools and/or blocked_tools.`,
+      );
+    }
+  }
+
+  // on_violation must NOT be set for tag, block, log actions (they don't produce violations)
+  if (["tag", "block", "log"].includes(rule.action) && rule.on_violation !== undefined) {
+    throw new PolicyLoadError(
+      `${loc}: on_violation must not be set for action "${rule.action}".`,
+    );
+  }
+
+  // on_violation is required for redact, classify, enforce
+  if (["redact", "classify", "enforce"].includes(rule.action) && !rule.on_violation) {
+    throw new PolicyLoadError(
+      `${loc}: on_violation is required for action "${rule.action}".`,
+    );
+  }
+
+  if (rule.sample_rate !== undefined) {
+    if (rule.sample_rate <= 0 || rule.sample_rate > 1) {
+      throw new PolicyLoadError(`${loc}: sample_rate must be between 0 (exclusive) and 1 (inclusive).`);
+    }
+    // Warn when a blocking rule is sampled below 100%
+    if (rule.on_violation === "block" && rule.sample_rate < 1.0) {
+      const rationale = rule.metadata?.["sampling_rationale"];
+      if (!rationale) {
+        console.warn(
+          `[TransparentGuard] WARNING: Rule "${rule.id}" has on_violation: block and sample_rate: ${rule.sample_rate}. ` +
+          `Approximately ${Math.round((1 - rule.sample_rate) * 100)}% of calls will not be checked by this rule. ` +
+          `If intentional, add a metadata.sampling_rationale field to suppress this warning.`,
+        );
+      }
+    }
+  }
+
+  // Streaming mode validation
+  if (rule.streaming) {
+    const validModes = ["buffer", "window", "passthrough"];
+    if (!validModes.includes(rule.streaming.mode)) {
+      throw new PolicyLoadError(
+        `${loc}: streaming.mode must be one of: ${validModes.join(", ")}.`,
+      );
+    }
+    if (rule.streaming.window_tokens !== undefined && rule.streaming.mode !== "window") {
+      throw new PolicyLoadError(
+        `${loc}: streaming.window_tokens is only valid when streaming.mode is "window".`,
+      );
+    }
+  }
+}
+
+function validateThreshold(
+  threshold: import("./types.js").TPSThreshold,
+  policyName: string,
+  ruleIds: Set<string>,
+): void {
+  const loc = `Policy ${policyName}, threshold "${threshold.id}"`;
+
+  if (!threshold.rule_id) {
+    throw new PolicyLoadError(`${loc}: threshold must specify rule_id.`);
+  }
+
+  // rule_id must reference an existing user rule or a tg_framework_ rule
+  if (!ruleIds.has(threshold.rule_id) && !threshold.rule_id.startsWith("tg_framework_")) {
+    throw new PolicyLoadError(
+      `${loc}: threshold rule_id "${threshold.rule_id}" does not reference a defined rule. ` +
+      `Use an existing rule id or a tg_framework_ prefixed framework rule id.`,
+    );
+  }
+
+  if (!threshold.count || threshold.count < 1) {
+    throw new PolicyLoadError(`${loc}: threshold count must be a positive integer greater than zero.`);
+  }
+
+  if (!threshold.window) {
+    throw new PolicyLoadError(`${loc}: threshold window is required.`);
+  }
+
+  const windowValid = /^\d+[mhd]$/.test(threshold.window);
+  if (!windowValid) {
+    throw new PolicyLoadError(
+      `${loc}: threshold window "${threshold.window}" is invalid. ` +
+      `Use format: integer followed by m (minutes), h (hours), or d (days). E.g. "1h", "30m", "7d".`,
+    );
+  }
+
+  const validActions = ["notify", "block_all", "escalate"];
+  if (!validActions.includes(threshold.action)) {
+    throw new PolicyLoadError(
+      `${loc}: threshold action must be one of: ${validActions.join(", ")}.`,
+    );
+  }
+
+  if (threshold.action === "notify" && !threshold.notify_url) {
+    throw new PolicyLoadError(
+      `${loc}: threshold action "notify" requires a notify_url.`,
+    );
+  }
+
+  if (threshold.notify_url && !threshold.notify_url.startsWith("https://")) {
+    throw new PolicyLoadError(
+      `${loc}: threshold notify_url must use https://.`,
+    );
+  }
+
+  if (threshold.action === "block_all" && !threshold.block_message) {
+    console.warn(
+      `[TransparentGuard] Threshold "${threshold.id}" uses action block_all without a block_message. ` +
+      `A default message will be used.`,
+    );
+  }
+
+  const validViolationTypes = ["blocked", "redacted", "warned", "error", "sampled_out"];
+  if (!validViolationTypes.includes(threshold.violation_type)) {
+    throw new PolicyLoadError(
+      `${loc}: violation_type must be one of: ${validViolationTypes.join(", ")}.`,
+    );
+  }
+}
