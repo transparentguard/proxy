@@ -16,16 +16,16 @@ COPY packages/proxy/package.json   ./packages/proxy/package.json
 RUN pnpm install --ignore-scripts
 
 # Copy source + tsconfig
-COPY packages/runtime/src/       ./packages/runtime/src/
+COPY packages/runtime/src/          ./packages/runtime/src/
 COPY packages/runtime/tsconfig*.json ./packages/runtime/
-COPY packages/proxy/src/         ./packages/proxy/src/
-COPY packages/proxy/tsconfig*.json  ./packages/proxy/
+COPY packages/proxy/src/            ./packages/proxy/src/
+COPY packages/proxy/tsconfig*.json   ./packages/proxy/
 
-# Compile runtime, then proxy
+# Compile runtime first (proxy depends on it), then proxy
 RUN pnpm --filter @transparentguard/runtime run build
 RUN pnpm --filter @transparentguard/proxy   run build
 
-# Bundle proxy + all production deps (including bundled runtime) into /prod
+# Bundle proxy + all production deps into /prod (workspace link resolved to real package)
 RUN pnpm deploy --filter @transparentguard/proxy --prod /prod
 
 # Stage 2: lean runtime image
@@ -33,15 +33,14 @@ FROM node:22-alpine AS runner
 RUN addgroup -S tgproxy && adduser -S -G tgproxy tgproxy
 WORKDIR /app
 
-# pnpm deploy creates a self-contained dir: node_modules + compiled dist
+# pnpm deploy output: node_modules (all prod deps incl. bundled runtime)
 COPY --from=builder --chown=tgproxy:tgproxy /prod/node_modules ./node_modules
+# Proxy compiled JS
 COPY --from=builder --chown=tgproxy:tgproxy /app/packages/proxy/dist ./dist
 
-# Default policy — permissive, no rules, audit off.
-# Override at runtime: set CMD or mount a real policy at /app/policy.yaml
-RUN mkdir -p /app/policies
-COPY --chown=tgproxy:tgproxy --from=builder /dev/null /dev/null 2>/dev/null || true
-RUN echo 'tps_version: "1.0"\nname: "TransparentGuard Default Policy"\nrules: []\naudit:\n  enabled: false' > /app/policies/default.yaml
+# Default permissive policy — no rules, audit off.
+# Override by mounting a real policy at /app/policy.yaml and setting --policy /app/policy.yaml
+RUN mkdir -p /app/policies && printf 'tps_version: "1.0"\nname: "TransparentGuard Default"\nrules: []\naudit:\n  enabled: false\n' > /app/policies/default.yaml
 
 USER tgproxy
 ENV PORT=8080
