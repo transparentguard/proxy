@@ -28,6 +28,12 @@ export interface RequestContext {
   path: string;
   upstreamApiKey: string;
   startMs: number;
+  /** Customer's TransparentGuard API key (before Unkey verification) */
+  tgApiKey: string;
+  /** Unkey key ID — empty string if Unkey not configured */
+  tgKeyId: string;
+  /** Customer tier resolved from Unkey metadata — "free" if not configured */
+  tier: string;
 }
 
 // ---------------------------------------------------------------------------
