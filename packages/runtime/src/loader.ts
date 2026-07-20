@@ -9,7 +9,7 @@ import fs from "fs";
 import path from "path";
 import crypto from "crypto";
 import yaml from "js-yaml";
-import Ajv from "ajv";
+import { Ajv2020 } from "ajv/dist/2020";
 import addFormats from "ajv-formats";
 import type { TPSPolicy, TPSRule, TPSSignature } from "./types.js";
 
@@ -364,7 +364,7 @@ const TPS_SCHEMA = {
   },
 };
 
-const ajv = new Ajv({ allErrors: true, strict: false });
+const ajv = new Ajv2020({ allErrors: true, strict: false });
 addFormats(ajv as Parameters<typeof addFormats>[0]);
 const validateSchema = ajv.compile(TPS_SCHEMA);
 
