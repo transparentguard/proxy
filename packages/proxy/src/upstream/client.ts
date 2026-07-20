@@ -6,9 +6,6 @@
  * verbatim, only swapping in the upstream API key.
  */
 
-// eslint-disable-next-line @typescript-eslint/no-require-imports
-const PROXY_VERSION: string = (require("../../package.json") as { version: string }).version;
-
 const UPSTREAM_TIMEOUT_MS = 120_000; // 2 minutes — generous for slow models
 
 // Headers that must NOT be forwarded to the upstream.
