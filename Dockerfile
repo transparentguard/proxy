@@ -11,7 +11,7 @@ RUN corepack enable && corepack prepare pnpm@latest --activate
 COPY package.json pnpm-workspace.yaml ./
 COPY packages/runtime/package.json ./packages/runtime/package.json
 COPY packages/proxy/package.json   ./packages/proxy/package.json
-RUN pnpm install --ignore-scripts
+RUN pnpm install
 
 # Copy source + config
 COPY packages/runtime/src/           ./packages/runtime/src/
