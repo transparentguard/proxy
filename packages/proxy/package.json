@@ -17,10 +17,7 @@
     "@transparentguard/runtime": "workspace:*",
     "@opentelemetry/api": "^1.9.1",
     "@opentelemetry/sdk-node": "^0.220.0",
-    "@opentelemetry/sdk-trace-node": "^2.9.0",
-    "@opentelemetry/exporter-trace-otlp-http": "^0.220.0",
-    "@opentelemetry/resources": "^2.9.0",
-    "@opentelemetry/semantic-conventions": "^1.43.0"
+    "@opentelemetry/exporter-trace-otlp-http": "^0.220.0"
   },
   "devDependencies": {
     "@types/node": "^20.14.0",
