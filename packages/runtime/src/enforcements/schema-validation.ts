@@ -3,12 +3,12 @@
  * Validates LLM response content against a declared JSON Schema.
  */
 
-import Ajv from "ajv";
+import { Ajv2020 } from "ajv/dist/2020";
 import addFormats from "ajv-formats";
 import type { EvaluationContext, ResponsePayload, RuleResult, Violation } from "../types.js";
 import { buildAuditEvent } from "../audit/emitter.js";
 
-const ajv = new Ajv({ allErrors: true, strict: false });
+const ajv = new Ajv2020({ allErrors: true, strict: false });
 addFormats(ajv as Parameters<typeof addFormats>[0]);
 
 // Cache compiled validators keyed by rule ID
