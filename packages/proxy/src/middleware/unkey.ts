@@ -55,15 +55,16 @@ export async function verifyUnkey(customerKey: string): Promise<UnkeyVerifyResul
     return { valid: false, keyId: "", tier: "free", errorCode: `unkey_http_${res.status}` };
   }
 
-  const raw = await res.json();
-  console.log("[TG] Unkey raw response:", JSON.stringify(raw));
-  const data = raw as {
-    valid: boolean;
-    keyId?: string;
-    meta?: { tier?: string };
-    code?: string;
-    error?: string;
+  const envelope = await res.json() as {
+    data: {
+      valid: boolean;
+      code: string;
+      keyId?: string;
+      meta?: Record<string, unknown>;
+    };
   };
+
+  const data = envelope.data;
 
   if (!data.valid) {
     return {
