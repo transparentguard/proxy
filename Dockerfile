@@ -31,15 +31,6 @@ RUN pnpm --filter @transparentguard/proxy   run build
 # workspace:* resolved to real package contents (runtime dist included)
 RUN pnpm deploy --filter @transparentguard/proxy --prod /prod
 
-# Hard-copy runtime dist as a safety guarantee:
-# pnpm deploy respects the runtime's "files" field; if dist/ is missing
-# from that list or the field references non-existent files, this ensures
-# the compiled runtime is always present in the final bundle.
-RUN mkdir -p /prod/node_modules/@transparentguard/runtime && \
-    cp  packages/runtime/package.json \
-        /prod/node_modules/@transparentguard/runtime/package.json && \
-    cp -r packages/runtime/dist \
-          /prod/node_modules/@transparentguard/runtime/dist
 
 # ============================================================
 # Stage 2: lean runtime image
