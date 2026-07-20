@@ -5,5 +5,8 @@
   "scripts": {
     "build": "pnpm --filter @transparentguard/runtime run build && pnpm --filter @transparentguard/proxy run build",
     "typecheck": "pnpm -r run typecheck"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": ["protobufjs"]
   }
 }
