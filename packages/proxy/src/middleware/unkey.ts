@@ -16,7 +16,7 @@ export interface UnkeyVerifyResult {
   errorCode?: string;
 }
 
-const UNKEY_VERIFY_URL = "https://api.unkey.dev/v1/keys.verifyKey";
+const UNKEY_VERIFY_URL = "https://api.unkey.com/v2/keys.verifyKey";
 const TIMEOUT_MS = 5_000;
 
 /**
@@ -32,12 +32,15 @@ export async function verifyUnkey(customerKey: string): Promise<UnkeyVerifyResul
   const headers: Record<string, string> = { "Content-Type": "application/json" };
   if (rootKey) headers["Authorization"] = `Bearer ${rootKey}`;
 
+  // apiId is not needed in v2 — the key identifies itself
+  void apiId;
+
   let res: Response;
   try {
     res = await fetch(UNKEY_VERIFY_URL, {
       method: "POST",
       headers,
-      body: JSON.stringify({ apiId, key: customerKey }),
+      body: JSON.stringify({ key: customerKey }),
       signal: AbortSignal.timeout(TIMEOUT_MS),
     });
   } catch (err) {
