@@ -1,8 +1,8 @@
 /**
  * TransparentGuard Proxy — OpenTelemetry Tracing Initialization
  *
- * Initializes the OTEL Node.js SDK when OTEL_EXPORTER_OTLP_ENDPOINT is set.
- * If the env var is absent, tracing is a no-op — zero overhead, zero config required.
+ * Uses @opentelemetry/sdk-node (NodeSDK) — the stable high-level API.
+ * Tracing is a no-op when OTEL_EXPORTER_OTLP_ENDPOINT is not set.
  *
  * Standard OTEL env vars are honoured automatically:
  *   OTEL_EXPORTER_OTLP_ENDPOINT  - collector endpoint (e.g. http://localhost:4318)
@@ -10,9 +10,8 @@
  *   OTEL_EXPORTER_OTLP_HEADERS   - auth/routing headers (comma-separated key=value)
  */
 
-import { NodeTracerProvider, BatchSpanProcessor } from "@opentelemetry/sdk-trace-node";
+import { NodeSDK } from "@opentelemetry/sdk-node";
 import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-http";
-import { Resource } from "@opentelemetry/resources";
 import {
   trace,
   context,
@@ -27,7 +26,7 @@ export type { Tracer, Span };
 
 export const TRACER_NAME = "transparentguard-proxy";
 
-let provider: NodeTracerProvider | null = null;
+let sdk: NodeSDK | null = null;
 let tracer: Tracer | null = null;
 
 /**
@@ -39,24 +38,16 @@ export function initTelemetry(serviceName: string = "transparentguard-proxy"): v
   const endpoint = process.env["OTEL_EXPORTER_OTLP_ENDPOINT"];
 
   if (!endpoint) return; // No collector configured — stay in no-op mode.
-  if (provider) return; // Already initialized.
+  if (sdk) return;       // Already initialized.
 
-  provider = new NodeTracerProvider({
-    resource: new Resource({
-      "service.name": serviceName,
-      "service.version": "0.1.0",
+  sdk = new NodeSDK({
+    serviceName,
+    traceExporter: new OTLPTraceExporter({
+      url: endpoint.replace(/\/$/, "") + "/v1/traces",
     }),
   });
 
-  provider.addSpanProcessor(
-    new BatchSpanProcessor(
-      new OTLPTraceExporter({
-        url: endpoint.replace(/\/$/, "") + "/v1/traces",
-      }),
-    ),
-  );
-
-  provider.register(); // Registers as the global TracerProvider
+  sdk.start();
 
   console.log(
     `[TransparentGuard] OTEL tracing enabled — exporting to ${endpoint}`,
@@ -77,9 +68,9 @@ export function getTracer(): Tracer {
  * Flush all pending spans and shut down the SDK. Call before process exit.
  */
 export async function shutdownTelemetry(): Promise<void> {
-  if (provider) {
-    await provider.shutdown();
-    provider = null;
+  if (sdk) {
+    await sdk.shutdown();
+    sdk = null;
     tracer = null;
   }
 }
