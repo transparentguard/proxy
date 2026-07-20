@@ -1,37 +1,9 @@
 {
-  "name": "@transparentguard/proxy",
+  "name": "transparentguard",
+  "private": true,
   "version": "0.1.0",
-  "description": "TransparentGuard Proxy Server — OpenAI-compatible HTTP proxy with policy enforcement, OTEL tracing, and OCI-native policy distribution",
-  "main": "dist/index.js",
-  "types": "dist/index.d.ts",
-  "bin": {
-    "tg-proxy": "./dist/index.js"
-  },
   "scripts": {
-    "build": "tsc --project tsconfig.build.json",
-    "typecheck": "tsc --noEmit",
-    "start": "node dist/index.js",
-    "dev": "node --require ts-node/register src/index.ts"
-  },
-  "dependencies": {
-    "@transparentguard/runtime": "workspace:*",
-    "@opentelemetry/api": "^1.9.0",
-    "@opentelemetry/sdk-node": "^1.28.0",
-    "@opentelemetry/exporter-trace-otlp-http": "^0.55.0",
-    "@opentelemetry/resources": "^1.28.0",
-    "@opentelemetry/semantic-conventions": "^1.27.0"
-  },
-  "devDependencies": {
-    "@types/node": "^20.14.0",
-    "typescript": "~5.9.3"
-  },
-  "engines": {
-    "node": ">=18.0.0"
-  },
-  "license": "MIT",
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/transparentguard/proxy"
-  },
-  "homepage": "https://transparentguard.com"
+    "build": "pnpm --filter @transparentguard/runtime run build && pnpm --filter @transparentguard/proxy run build",
+    "typecheck": "pnpm -r run typecheck"
+  }
 }
