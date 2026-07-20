@@ -2,26 +2,19 @@
 /**
  * TransparentGuard Proxy Server — CLI Entry Point
  *
- * Usage:
- *   tg-proxy --policy ./policy.yaml --upstream https://api.openai.com [options]
+ * All flags have environment-variable equivalents so Railway / Docker
+ * users never need to touch the CMD:
  *
- * Options:
- *   --policy, -p          <path|oci://ref>  TPS policy file or OCI artifact reference (required)
- *   --upstream, -u        <url>             Upstream LLM API base URL (required)
- *   --port                <number>          Port to listen on (default: $PORT or 8080)
- *   --upstream-api-key    <key>             Override upstream API key (default: from client Authorization header)
- *   --tg-api-key          <key>             TransparentGuard API key for paid-tier features
- *   --log-level           debug|info|error  Log verbosity (default: info)
- *   --offline-mode                          Skip license check (free tier only)
- *
- * Environment variables:
- *   PORT                            Overrides --port
- *   UPSTREAM_API_KEY                Overrides --upstream-api-key
- *   TG_API_KEY                      Overrides --tg-api-key
- *   OTEL_EXPORTER_OTLP_ENDPOINT     Enables OTEL tracing (no-op if absent)
- *   OTEL_SERVICE_NAME               OTEL service name (default: transparentguard-proxy)
- *   TG_COSIGN_VERIFY                Set to "true" to require Cosign verification on OCI policies
- *   TG_COSIGN_PUBLIC_KEY_PATH       Path to PEM public key for Cosign verification
+ *   Flag                  Env var               Default
+ *   --policy              TG_POLICY_PATH        /app/policies/default.yaml
+ *   --upstream            UPSTREAM_URL          https://api.openai.com
+ *   --port                PORT                  8080
+ *   --upstream-api-key    UPSTREAM_API_KEY      (none — forwards client key)
+ *   --tg-api-key          TG_API_KEY            (none — free tier)
+ *   --log-level           TG_LOG_LEVEL          info
+ *   --offline-mode        TG_OFFLINE_MODE       false
+ *   (n/a)                 OTEL_EXPORTER_OTLP_ENDPOINT  enables tracing
+ *   (n/a)                 OTEL_SERVICE_NAME     transparentguard-proxy
  */
 
 import { parseArgs } from "node:util";
@@ -30,88 +23,99 @@ import { initTelemetry, shutdownTelemetry } from "./telemetry.js";
 import { startServer } from "./server.js";
 
 // ---------------------------------------------------------------------------
-// CLI argument parsing
+// CLI argument parsing (all optional — env vars fill the gaps)
 // ---------------------------------------------------------------------------
 
 const { values: argv } = parseArgs({
   options: {
-    policy:            { type: "string",  short: "p" },
-    upstream:          { type: "string",  short: "u" },
-    port:              { type: "string" },
-    "upstream-api-key": { type: "string" },
-    "tg-api-key":      { type: "string" },
-    "log-level":       { type: "string",  default: "info" },
-    "offline-mode":    { type: "boolean", default: false },
+    policy:              { type: "string",  short: "p" },
+    upstream:            { type: "string",  short: "u" },
+    port:                { type: "string" },
+    "upstream-api-key":  { type: "string" },
+    "tg-api-key":        { type: "string" },
+    "log-level":         { type: "string",  default: "info" },
+    "offline-mode":      { type: "boolean", default: false },
   },
   strict: true,
   allowPositionals: false,
 });
 
 // ---------------------------------------------------------------------------
-// Validation
+// Resolve values: flag → env var → built-in default
 // ---------------------------------------------------------------------------
 
-if (!argv.policy) {
-  console.error(
-    "Error: --policy is required.\n" +
-    "  Example: --policy ./policy.yaml\n" +
-    "           --policy oci://ghcr.io/myorg/my-policy:v1.0.0",
-  );
-  process.exit(1);
-}
+const policyPath: string =
+  argv.policy ??
+  process.env["TG_POLICY_PATH"] ??
+  "/app/policies/default.yaml";
 
-if (!argv.upstream) {
-  console.error(
-    "Error: --upstream is required.\n" +
-    "  Example: --upstream https://api.openai.com\n" +
-    "           --upstream https://api.anthropic.com",
-  );
-  process.exit(1);
-}
+const upstreamUrl: string =
+  argv.upstream ??
+  process.env["UPSTREAM_URL"] ??
+  "https://api.openai.com";
 
 const port = parseInt(
   argv.port ?? process.env["PORT"] ?? "8080",
   10,
 );
 
+const logLevel = (
+  argv["log-level"] ??
+  process.env["TG_LOG_LEVEL"] ??
+  "info"
+) as "debug" | "info" | "error";
+
+const offlineMode: boolean =
+  argv["offline-mode"] ||
+  process.env["TG_OFFLINE_MODE"] === "true";
+
+// ---------------------------------------------------------------------------
+// Validation
+// ---------------------------------------------------------------------------
+
 if (isNaN(port) || port < 1 || port > 65535) {
-  console.error(`Error: Invalid port: ${String(argv.port ?? process.env["PORT"])}`);
+  console.error(`[TransparentGuard] Fatal: Invalid port "${String(argv.port ?? process.env["PORT"])}"`);
+  process.exit(1);
+}
+
+if (!["debug", "info", "error"].includes(logLevel)) {
+  console.error(`[TransparentGuard] Fatal: Invalid log level "${logLevel}". Use debug | info | error.`);
   process.exit(1);
 }
 
 // ---------------------------------------------------------------------------
-// Main async startup
+// Main
 // ---------------------------------------------------------------------------
 
 async function main(): Promise<void> {
-  // Initialize OTEL before anything else — must precede any instrumented code.
+  // Init OTEL first — must precede any instrumented code
   const otelServiceName =
     process.env["OTEL_SERVICE_NAME"] ?? "transparentguard-proxy";
   initTelemetry(otelServiceName);
 
-  // Load policy
-  console.log(`[TransparentGuard] Loading policy: ${argv.policy}`);
+  console.log(`[TransparentGuard] Loading policy: ${policyPath}`);
 
   let tg: TransparentGuard;
   try {
     tg = await TransparentGuard.init({
-      policy: argv.policy as string,
+      policy: policyPath,
       apiKey: argv["tg-api-key"] ?? process.env["TG_API_KEY"],
-      offlineMode: argv["offline-mode"],
+      offlineMode,
     });
     console.log(`[TransparentGuard] Policy loaded: "${tg.getPolicy().name}"`);
   } catch (err) {
-    console.error(`[TransparentGuard] Fatal: Failed to load policy.\n  ${String(err)}`);
+    console.error(`[TransparentGuard] Fatal: Failed to load policy from "${policyPath}".\n  ${String(err)}`);
     process.exit(1);
   }
 
-  // Start HTTP server
+  console.log(`[TransparentGuard] Upstream: ${upstreamUrl}`);
+
   const server = startServer({
     tg,
-    upstream: argv.upstream as string,
+    upstream: upstreamUrl,
     upstreamApiKey: argv["upstream-api-key"] ?? process.env["UPSTREAM_API_KEY"],
     port,
-    logLevel: (argv["log-level"] as "debug" | "info" | "error") ?? "info",
+    logLevel,
   });
 
   // ---------------------------------------------------------------------------
@@ -122,27 +126,25 @@ async function main(): Promise<void> {
   const shutdown = (signal: string): void => {
     if (shutdownInProgress) return;
     shutdownInProgress = true;
-    console.log(`\n[TransparentGuard] Received ${signal} — shutting down gracefully...`);
+    console.log(`\n[TransparentGuard] ${signal} received — shutting down gracefully...`);
 
     server.close(() => {
       console.log("[TransparentGuard] HTTP server closed.");
-
-      // Flush audit events and OTEL spans before exit
       void Promise.all([
         tg.flushAudit(),
         shutdownTelemetry(),
       ]).then(() => {
         console.log("[TransparentGuard] Shutdown complete.");
         process.exit(0);
-      }).catch((err) => {
-        console.error(`[TransparentGuard] Shutdown error: ${String(err)}`);
+      }).catch((shutdownErr: unknown) => {
+        console.error(`[TransparentGuard] Shutdown error: ${String(shutdownErr)}`);
         process.exit(1);
       });
     });
 
-    // Force-exit after 10 seconds if graceful shutdown stalls
+    // Force-exit if graceful shutdown stalls
     setTimeout(() => {
-      console.error("[TransparentGuard] Force-exiting after timeout.");
+      console.error("[TransparentGuard] Force-exiting after 10 s timeout.");
       process.exit(1);
     }, 10_000).unref();
   };
