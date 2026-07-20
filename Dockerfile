@@ -25,7 +25,7 @@ RUN pnpm --filter @transparentguard/proxy   run build
 
 # pnpm deploy: creates /prod with a self-contained non-symlinked node_modules
 # workspace:* links are resolved to real package contents
-RUN pnpm deploy --filter @transparentguard/proxy --prod /prod
+RUN pnpm deploy --legacy --filter @transparentguard/proxy --prod /prod
 
 # Guarantee the runtime dist is present even if pnpm deploy skips it
 # (happens when runtime package.json files field lists non-existent README/LICENSE)
