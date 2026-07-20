@@ -1,0 +1,637 @@
+/**
+ * @transparentguard/runtime
+ *
+ * TransparentGuard Runtime — AI policy enforcement engine.
+ * Implements the TransparentGuard Policy Spec (TPS) v1.0.
+ *
+ * @example Drop-in wrapper (recommended):
+ * ```typescript
+ * import { TransparentGuard } from "@transparentguard/runtime";
+ * import OpenAI from "openai";
+ *
+ * const tg = await TransparentGuard.init({
+ *   policy: "./policies/production-hipaa.yaml",
+ *   apiKey: process.env.TG_API_KEY,
+ * });
+ *
+ * const client = tg.wrap(new OpenAI());
+ * const response = await client.chat.completions.create({ ... });
+ * ```
+ *
+ * @example Direct evaluate() call:
+ * ```typescript
+ * const result = await tg.evaluate("pre-request", {
+ *   messages: [{ role: "user", content: "Hello" }],
+ *   provider: "openai/gpt-4o",
+ * });
+ * if (!result.allowed) throw new Error(result.violations[0]?.detail ?? "Blocked");
+ * ```
+ */
+
+import type {
+  EvaluateOptions,
+  EvaluateResult,
+  RequestPayload,
+  ResponsePayload,
+  RuleStage,
+  TPSPolicy,
+  TransparentGuardOptions,
+} from "./types.js";
+import { loadPolicy, parsePolicy } from "./loader.js";
+import { evaluate as coreEvaluate } from "./engine.js";
+import { checkLicense, assertFeature } from "./license/checker.js";
+import { AuditEmitter } from "./audit/emitter.js";
+import { WrappedOpenAIClient } from "./wrappers/openai.js";
+import { WrappedAnthropicClient } from "./wrappers/anthropic.js";
+import { runPolicyTests, formatTestResults } from "./testing/runner.js";
+import type { LicenseStatus } from "./license/checker.js";
+import type { OpenAIClientLike } from "./wrappers/openai.js";
+import type { AnthropicClientLike } from "./wrappers/anthropic.js";
+import type { PolicyTestSuiteResult } from "./testing/runner.js";
+
+// ---------------------------------------------------------------------------
+// Public type exports
+// ---------------------------------------------------------------------------
+
+export type {
+  // Policy types
+  TPSPolicy,
+  TPSRule,
+  TPSAudit,
+  TPSEnvironment,
+  TPSSignature,
+  TPSPolicyTest,
+  TPSPolicyTestExpect,
+  TPSPolicyTestInput,
+  TPSPolicyTestExpectRuleTriggered,
+  TPSPolicyTestExpectRedaction,
+  TPSThreshold,
+  ThresholdAction,
+  ThresholdViolationType,
+  ThresholdPayloadTemplate,
+  ComplianceFramework,
+  PiiCategory,
+  PiiTarget,
+  PatternTarget,
+  KeywordTarget,
+  SemanticTarget,
+  TPSTarget,
+  RuleStage,
+  RuleAction,
+  EnforceType,
+  OnViolation,
+  RuleStreaming,
+  AuditNotify,
+  AuditStreamingConfig,
+  AuditChainIntegrity,
+  // Streaming (Phase 10)
+  StreamMode,
+  OnStreamViolation,
+  // Payload types
+  Message,
+  RequestPayload,
+  ResponsePayload,
+  ToolCall,
+  ToolCallPayload,
+  // Result types
+  EvaluateResult,
+  Violation,
+  ViolationOutcome,
+  AuditEvent,
+  AuditEventType,
+  OCSFEvent,
+  // Options
+  TransparentGuardOptions,
+  EvaluateOptions,
+  // Internal
+  CompiledRule,
+  EvaluationContext,
+  RuleResult,
+} from "./types.js";
+
+export { PolicyLoadError, PolicySignatureError } from "./loader.js";
+export { TransparentGuardError, verifyOfflineKey, assertFeature, checkLicense } from "./license/checker.js";
+export type { LicenseStatus, LicenseTier, LicenseFeature } from "./license/checker.js";
+export { toOcsfEvent } from "./audit/ocsf.js";
+export { approximateTokenCount } from "./enforcements/token-budget.js";
+export { detectPii, redactText, expandCategories } from "./evaluators/pii.js";
+export { runPolicyTests, formatTestResults } from "./testing/runner.js";
+export type { PolicyTestResult, PolicyTestSuiteResult } from "./testing/runner.js";
+export { getBlockAllState, clearBlockAll, parseWindowMs } from "./threshold/engine.js";
+
+// ---------------------------------------------------------------------------
+// Phase 5 — Compliance framework rule sets
+// ---------------------------------------------------------------------------
+export { HIPAA_RULES } from "./frameworks/hipaa.js";
+export { GDPR_RULES } from "./frameworks/gdpr.js";
+export { SOC2_RULES } from "./frameworks/soc2.js";
+export { EU_AI_ACT_RULES } from "./frameworks/eu-ai-act.js";
+export { FEDRAMP_RULES } from "./frameworks/fedramp.js";
+
+// ---------------------------------------------------------------------------
+// Phase 5 — Advanced classifiers
+// ---------------------------------------------------------------------------
+export { classifyMedicalPii } from "./evaluators/built-in/pii-medical-v1.js";
+export { classifyFinancialPii } from "./evaluators/built-in/pii-financial-v1.js";
+
+// ---------------------------------------------------------------------------
+// Phase 5 — Custom classifier registry (OEM)
+// ---------------------------------------------------------------------------
+export {
+  registerClassifier,
+  getClassifier,
+  listClassifiers,
+  resolveCustomClassifier,
+} from "./evaluators/classifier-registry.js";
+export type { CustomClassifierDef } from "./evaluators/classifier-registry.js";
+
+// ---------------------------------------------------------------------------
+// Phase 5 — Policy Intelligence Engine (PIE)
+// ---------------------------------------------------------------------------
+export { generateEvidencePackage } from "./pie/evidence.js";
+export type { EvidencePackage, EvidenceControl, EvidenceExportOptions } from "./pie/evidence.js";
+export { checkFrameworkDrift, getFrameworkVersion, getAllFrameworkVersions } from "./pie/drift.js";
+export type { DriftWarning } from "./pie/drift.js";
+export { runShadowClassifier } from "./pie/shadow.js";
+export type { PIEShadowModeConfig as PIEShadowConfig } from "./pie/shadow.js";
+
+// ---------------------------------------------------------------------------
+// Phase 5 — Cryptographic Trust Chain
+// ---------------------------------------------------------------------------
+export { generateReceipt, verifyReceipt, getSigningPublicKey } from "./trust/receipt.js";
+export {
+  startKeyRotationWatcher,
+  stopKeyRotationWatcher,
+  getActivePublicKeys,
+  getActiveKeySet,
+  findPublicKey,
+} from "./trust/keys.js";
+export type { JwkPublicKey, KeySet } from "./trust/keys.js";
+
+// ---------------------------------------------------------------------------
+// Phase 10 — Streaming Enforcement Engine (Section 25)
+// ---------------------------------------------------------------------------
+export {
+  resolveStreamConfig,
+  evaluateWindowedStream,
+  evaluatePassthroughStream,
+} from "./streaming/stream-evaluator.js";
+export type {
+  StreamEvalConfig,
+  StreamChunkAdapter,
+} from "./streaming/stream-evaluator.js";
+
+// ---------------------------------------------------------------------------
+// Phase 10 — Provider Adapter Interface (Section 30)
+// ---------------------------------------------------------------------------
+export type {
+  ProviderAdapter,
+  ProviderAuthConfig,
+  ProviderRegionInfo,
+} from "./adapters/adapter.js";
+export { openAIAdapter } from "./adapters/openai.js";
+export { anthropicAdapter } from "./adapters/anthropic.js";
+export { groqAdapter } from "./adapters/groq.js";
+export { vertexAdapter } from "./adapters/vertex.js";
+export { mistralAdapter } from "./adapters/mistral.js";
+export { vllmAdapter } from "./adapters/vllm.js";
+export { bedrockAdapter } from "./adapters/bedrock.js";
+export { deepSeekAdapter } from "./adapters/deepseek.js";
+export { moonshotAdapter } from "./adapters/moonshot.js";
+export { zhipuAdapter } from "./adapters/zhipu.js";
+export { baichuanAdapter } from "./adapters/baichuan.js";
+export {
+  registerAdapter,
+  resolveAdapter,
+  listAdapters,
+  hasAdapter,
+} from "./adapters/loader.js";
+
+// ---------------------------------------------------------------------------
+// Gate 1 — Policy-level license validator
+// ---------------------------------------------------------------------------
+
+/**
+ * Scans a fully-loaded policy and throws immediately if any declared feature
+ * exceeds what the current license covers.
+ *
+ * This is Gate 1 — it fires at TransparentGuard.init() time so a misconfigured
+ * policy is rejected before any LLM call is ever made.
+ *
+ * Gate 2 is the assertFeature() call at each individual execution site inside
+ * engine.ts, stream-evaluator.ts, audit/emitter.ts, and adapters/loader.ts.
+ * Both gates must be bypassed independently — patching one leaves the other intact.
+ *
+ * The tier model is strictly cumulative (compounding upward):
+ *   Free < Startup < Growth < Enterprise < OEM
+ * Each tier includes all features from every tier below it.
+ */
+function validatePolicyLicense(policy: TPSPolicy, license: LicenseStatus): void {
+  // Compliance framework templates — Startup+
+  if ((policy.compliance_frameworks ?? []).length > 0) {
+    assertFeature(license, "compliance_frameworks",
+      "Compliance framework templates (HIPAA, GDPR, EU AI Act, SOC 2, FedRAMP)");
+  }
+
+  // PIE config — Growth+
+  if (policy.pie) {
+    assertFeature(license, "pie", "Policy Intelligence Engine (PIE)");
+  }
+
+  // Multi-environment block — Growth+
+  if ((policy.environments ?? []).length > 0) {
+    assertFeature(license, "multi_environment", "Multi-environment policy scoping");
+  }
+
+  // Streaming window / passthrough — Startup+
+  const streamMode = policy.audit?.streaming?.mode;
+  if (streamMode === "window" || streamMode === "passthrough") {
+    assertFeature(license, "streaming_window", "Streaming window/passthrough mode");
+  }
+
+  // Audit chain integrity — Startup+
+  if (policy.audit?.chain_integrity?.enabled) {
+    assertFeature(license, "audit_chain_integrity", "Audit chain integrity");
+  }
+
+  // Audit destinations — Startup+
+  const dest = policy.audit?.destination;
+  if (dest) {
+    if (dest.startsWith("s3://")) {
+      assertFeature(license, "audit_s3", "S3 audit destinations");
+    } else if (dest.startsWith("postgres://") || dest.startsWith("postgresql://")) {
+      assertFeature(license, "audit_postgres", "PostgreSQL audit destinations");
+    } else if (dest.startsWith("gcs://")) {
+      assertFeature(license, "audit_gcs", "GCS audit destinations");
+    } else if (dest.startsWith("azure://")) {
+      assertFeature(license, "audit_azure", "Azure audit destinations");
+    }
+  }
+
+  // Custom classifier registry — OEM
+  if ((policy.custom_classifiers ?? []).length > 0) {
+    assertFeature(license, "oem_embed", "Custom classifier registry");
+  }
+
+  // Rule-level feature checks
+  for (const rule of policy.rules ?? []) {
+    // ML classifiers — Startup+
+    if (rule.action === "classify") {
+      assertFeature(license, "ml_classifiers", "ML classifier rules");
+    }
+
+    if (rule.action === "enforce") {
+      // Confidentiality enforcement — Startup+
+      if (rule.enforce_type === "confidentiality") {
+        assertFeature(license, "confidentiality_check", "Confidentiality enforcement rules");
+      }
+      // Data sovereignty — Enterprise+
+      if (rule.enforce_type === "data_sovereignty") {
+        assertFeature(license, "data_sovereignty", "Data sovereignty enforcement");
+      }
+    }
+
+    // Provider risk-tier filtering — Startup+
+    if ((rule.provider_match as { risk_tier?: string[] } | undefined)?.risk_tier?.length) {
+      assertFeature(license, "provider_risk_tier", "Provider risk-tier filtering");
+    }
+
+    // Blocked training jurisdictions — Enterprise+
+    if ((rule.provider_match as { blocked_training_jurisdictions?: string[] } | undefined)
+      ?.blocked_training_jurisdictions?.length) {
+      assertFeature(license, "blocked_training_jurisdictions",
+        "Blocked training jurisdiction filtering");
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Main class
+// ---------------------------------------------------------------------------
+
+export class TransparentGuard {
+  private readonly policy: TPSPolicy;
+  private readonly license: LicenseStatus;
+  private readonly options: TransparentGuardOptions;
+  private readonly emitter: AuditEmitter;
+
+  private constructor(
+    policy: TPSPolicy,
+    license: LicenseStatus,
+    options: TransparentGuardOptions,
+  ) {
+    this.policy = policy;
+    this.license = license;
+    this.options = options;
+    this.emitter = new AuditEmitter(policy.audit, license.features);
+  }
+
+  /**
+   * Initialize TransparentGuard with a policy file path or inline policy object.
+   * Validates the policy, resolves `extends` chains, verifies signatures, and checks the license.
+   */
+  static async init(options: TransparentGuardOptions): Promise<TransparentGuard> {
+    let policy: TPSPolicy;
+    if (typeof options.policy === "string") {
+      policy = await loadPolicy(options.policy);
+    } else {
+      policy = options.policy;
+    }
+
+    const license = await checkLicense(
+      options.apiKey,
+      options.apiBaseUrl,
+      options.offlineMode,
+    );
+
+    // Gate 2: offline mode requires Enterprise tier
+    if (options.offlineMode) {
+      assertFeature(license, "offline_mode", "Offline mode (zero-network operation)");
+    }
+
+    // Gate 1: scan the full policy upfront and reject any feature the license does not cover.
+    // This runs before any evaluation so misconfigured policies fail fast at startup,
+    // not mid-request. Gate 2 assertFeature calls at each execution site provide the
+    // second enforcement layer — both must be patched out to bypass.
+    validatePolicyLicense(policy, license);
+
+    return new TransparentGuard(policy, license, options);
+  }
+
+  /**
+   * Evaluate a request or response payload against the loaded policy.
+   * The stored apiKey is automatically injected for paid-tier classifier access.
+   */
+  async evaluate(
+    stage: RuleStage,
+    payload: RequestPayload | ResponsePayload,
+    evaluateOptions: EvaluateOptions = {},
+  ): Promise<EvaluateResult> {
+    const result = await coreEvaluate(
+      stage,
+      payload,
+      this.policy,
+      this.license,
+      {
+        apiKey: this.options.apiKey, // inject stored apiKey
+        ...evaluateOptions,            // caller options take precedence
+      },
+    );
+    this.emitter.enqueueMany(result.audit_events);
+    return result;
+  }
+
+  /**
+   * Wraps an OpenAI or Anthropic client with transparent policy enforcement.
+   * The returned client is a drop-in replacement — use it exactly like the standard SDK.
+   */
+  wrap(client: OpenAIClientLike): WrappedOpenAIClient;
+  wrap(client: AnthropicClientLike): WrappedAnthropicClient;
+  wrap(client: OpenAIClientLike | AnthropicClientLike): WrappedOpenAIClient | WrappedAnthropicClient {
+    if (isOpenAIClient(client)) {
+      return new WrappedOpenAIClient(client, this.policy, this.license, this.options);
+    }
+    if (isAnthropicClient(client)) {
+      return new WrappedAnthropicClient(client, this.policy, this.license, this.options);
+    }
+    throw new Error(
+      "TransparentGuard.wrap(): unrecognized client type. " +
+      "Supported clients: OpenAI, Anthropic. " +
+      "For other providers, use the direct evaluate() API.",
+    );
+  }
+
+  /**
+   * Runs all inline tests declared in the policy's `tests` section.
+   * No real LLM calls are made — only policy evaluation logic is exercised.
+   */
+  async test(): Promise<PolicyTestSuiteResult> {
+    return runPolicyTests(this.policy, this.license);
+  }
+
+  /** Returns the loaded and validated policy object. */
+  getPolicy(): TPSPolicy {
+    return this.policy;
+  }
+
+  /** Returns the current license status. */
+  getLicenseStatus(): LicenseStatus {
+    return this.license;
+  }
+
+  /**
+   * Flushes all buffered audit events to the configured destination.
+   * Call before process shutdown to ensure no events are lost.
+   */
+  async flushAudit(): Promise<void> {
+    await this.emitter.flush();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Convenience factory — functional style
+// ---------------------------------------------------------------------------
+
+/**
+ * @example
+ * ```typescript
+ * import { tg } from "@transparentguard/runtime";
+ * const client = await tg.init({ policy: "./policy.yaml" });
+ * ```
+ */
+export const tg = {
+  init: TransparentGuard.init.bind(TransparentGuard),
+};
+
+// ---------------------------------------------------------------------------
+// Standalone utilities — no init required
+// ---------------------------------------------------------------------------
+
+export { parsePolicy, loadPolicy };
+
+// Wrapper client types — re-exported for SDK and consumer use
+export type {
+  OpenAIClientLike,
+  OpenAIChatCompletionCreateParams,
+  OpenAIChatCompletion,
+  OpenAIChatCompletionChunk,
+  OpenAIChatCompletionChunkDelta,
+  OpenAIChatCompletionChoice,
+  OpenAIChatCompletionChunkChoice,
+  WrappedOpenAIClient,
+} from "./wrappers/openai.js";
+
+export type {
+  AnthropicClientLike,
+  AnthropicCreateParams,
+  AnthropicResponse,
+  AnthropicStreamEvent,
+  AnthropicMessage,
+  AnthropicContentBlock,
+  WrappedAnthropicClient,
+} from "./wrappers/anthropic.js";
+
+/** Run policy tests without a TransparentGuard instance (CI helper) */
+export async function testPolicy(policy: TPSPolicy): Promise<PolicyTestSuiteResult> {
+  const { checkLicense: cl } = await import("./license/checker.js");
+  const license = await cl(undefined, undefined, false);
+  return runPolicyTests(policy, license);
+}
+
+// ---------------------------------------------------------------------------
+// Type guards for client detection
+// ---------------------------------------------------------------------------
+
+function isOpenAIClient(client: unknown): client is OpenAIClientLike {
+  return (
+    typeof client === "object" &&
+    client !== null &&
+    "chat" in client &&
+    typeof (client as { chat: unknown }).chat === "object" &&
+    (client as { chat: { completions?: unknown } }).chat !== null &&
+    "completions" in ((client as { chat: { completions?: unknown } }).chat ?? {})
+  );
+}
+
+function isAnthropicClient(client: unknown): client is AnthropicClientLike {
+  return (
+    typeof client === "object" &&
+    client !== null &&
+    "messages" in client &&
+    typeof (client as { messages: unknown }).messages === "object" &&
+    (client as { messages: { create?: unknown } }).messages !== null &&
+    "create" in ((client as { messages: { create?: unknown } }).messages ?? {})
+  );
+}
+
+// Re-export formatTestResults at top level for CLI usage
+export { formatTestResults as formatPolicyTestResults };
+
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Phase 9 — Provider Scoping + Data Sovereignty
+// ---------------------------------------------------------------------------
+export type {
+  ProviderCapabilityMatch,
+  DataSubjectJurisdiction,
+  TransferMechanismConfig,
+} from "./types.js";
+export { providerMatchesRuleScope, matchesProviderGlob } from "./enforcements/provider-scoping.js";
+export { enforceDataSovereignty } from "./enforcements/data-sovereignty.js";
+export { PROVIDER_REGISTRY } from "./registry/provider-registry.js";
+export type { ProviderRegistryEntry } from "./registry/provider-registry.js";
+export {
+  ADEQUACY_DECISIONS,
+  getAdequacyStatus,
+  isAdequate,
+  isInEEA,
+  EU_EEA_JURISDICTIONS,
+} from "./registry/adequacy-decisions.js";
+export type { AdequacyEntry, TransferMechanism } from "./registry/adequacy-decisions.js";
+
+// ---------------------------------------------------------------------------
+// Phase 8 — Custom Classifier Training Pipeline
+// ---------------------------------------------------------------------------
+export type {
+  LabeledExample,
+  DatasetStats,
+  DatasetVersion,
+  DatasetManifest,
+  TrainingSpec,
+  TrainingJob,
+  JobStatus,
+  ModelManifest,
+  ModelArtifact,
+  ModelCard,
+  ActiveLearningEntry,
+  DriftReport,
+  DriftWindowEntry,
+  SLSAProvenance,
+  ITrainerBackend,
+  DataSource,
+  BackendId,
+  ModelArchitecture,
+  AddExampleOptions,
+  ValidationReport,
+  ValidationFinding,
+  ValidationSeverity,
+  ValidationConfig,
+  SnapshotResult,
+  AutoLabelResult,
+  ModelLoadOptions,
+} from "./training/index.js";
+export {
+  // Dataset — store
+  tgDataDir,
+  datasetDir,
+  textId,
+  fileHash,
+  readExamples,
+  readVersionedExamples,
+  addExample,
+  importJsonl,
+  computeStats,
+  exportJsonl,
+  getManifest,
+  listDatasets,
+  // Dataset — validator
+  validateDataset,
+  formatValidationReport,
+  // Dataset — versioning
+  createSnapshot,
+  listVersions,
+  resolveDatasetVersion,
+  verifySnapshot,
+  formatVersionList,
+  // Dataset — auto-labeler
+  registerAutoLabeler,
+  autoLabel,
+  autoLabelFromFile,
+  // Dataset — drift
+  appendDriftEntry,
+  readDriftWindow,
+  checkDrift,
+  // Jobs — manager
+  listJobs,
+  getJob,
+  submitJob,
+  refreshJobStatus,
+  cancelTrainingJob,
+  formatJobList,
+  // Jobs — manifest (SLSA)
+  buildProvenance,
+  signProvenance,
+  verifyProvenance,
+  formatProvenance,
+  // Backends
+  registerBackend,
+  getBackend,
+  listBackends,
+  localBackend,
+  LocalTrainerBackend,
+  // Models — store
+  modelsBaseDir,
+  modelDir,
+  artifactDir,
+  weightsHash,
+  createArtifact,
+  loadArtifact,
+  resolveModelVersion,
+  updateManifest,
+  setHead,
+  listModelClassifiers,
+  listArtifactVersions,
+  formatModelList,
+  // Models — loader
+  appendActiveLearningEntry,
+  readActiveLearningQueue,
+  clearActiveLearningQueue,
+  loadAndInfer,
+  // Models — signing
+  signArtifact,
+  verifyArtifact,
+  // Models — card
+  generateModelCard,
+  formatModelCard,
+  toHuggingFaceReadme,
+} from "./training/index.js";
